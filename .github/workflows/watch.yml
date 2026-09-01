@@ -15,15 +15,17 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - run: pip install --quiet requests beautifulsoup4
+      - run: pip install requests beautifulsoup4
 
-      - name: Scripti yaz
+      - name: Sayfayi kontrol et
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          cat > check.py <<'PYEOF'
+          python3 - <<'PYEOF'
           import hashlib, json, os, re, sys
           from pathlib import Path
           import requests
@@ -43,7 +45,7 @@ jobs:
 
 
           def fetch(url):
-              r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+              r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
               r.raise_for_status()
               r.encoding = r.apparent_encoding or "utf-8"
               soup = BeautifulSoup(r.text, "html.parser")
@@ -69,7 +71,7 @@ jobs:
                   json={"chat_id": os.environ["TELEGRAM_CHAT_ID"],
                         "text": text,
                         "disable_web_page_preview": True},
-                  timeout=25)
+                  timeout=30)
               if not resp.ok:
                   print("Telegram hatasi:", resp.status_code, resp.text,
                         file=sys.stderr)
@@ -127,21 +129,7 @@ jobs:
                                encoding="utf-8")
           PYEOF
 
-      - name: Dakikada bir kontrol et
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          DEADLINE=$(( $(date +%s) + 240 ))   # ~4 dakika calis, sonraki cron devrali
-          while : ; do
-            python3 check.py || echo "kontrol basarisiz, devam ediliyor"
-            NOW=$(date +%s)
-            [ "$NOW" -ge "$DEADLINE" ] && break
-            sleep 55
-          done
-
       - name: Durumu kaydet
-        if: always()
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "togg-watcher"
