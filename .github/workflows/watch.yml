@@ -1,0 +1,153 @@
+name: Togg izleyici
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub'in izin verdigi en sik deger
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: togg-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: pip install --quiet requests beautifulsoup4
+
+      - name: Scripti yaz
+        run: |
+          cat > check.py <<'PYEOF'
+          import hashlib, json, os, re, sys
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          URLS = [
+              "https://www.togg.com.tr/sales-and-finance",
+          ]
+
+          STATE = Path("state.json")
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+          DROP_TAGS = ["script", "style", "noscript", "svg", "iframe",
+                       "nav", "footer", "form"]
+          DROP_LINES = {"asagi kaydir", "aşağı kaydır", "scroll down",
+                        "türkçe", "turkce", "english", "#"}
+
+
+          def fetch(url):
+              r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or "utf-8"
+              soup = BeautifulSoup(r.text, "html.parser")
+              for t in soup(DROP_TAGS):
+                  t.decompose()
+              out = []
+              for line in soup.get_text("\n").splitlines():
+                  line = re.sub(r"\s+", " ", line).strip()
+                  if not line or line.lower() in DROP_LINES:
+                      continue
+                  if out and out[-1] == line:
+                      continue
+                  out.append(line)
+              return out
+
+
+          def tg(text):
+              if len(text) > 3900:
+                  text = text[:3900] + "\n... (kisaltildi)"
+              resp = requests.post(
+                  "https://api.telegram.org/bot%s/sendMessage"
+                  % os.environ["TELEGRAM_BOT_TOKEN"],
+                  json={"chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                        "text": text,
+                        "disable_web_page_preview": True},
+                  timeout=25)
+              if not resp.ok:
+                  print("Telegram hatasi:", resp.status_code, resp.text,
+                        file=sys.stderr)
+                  resp.raise_for_status()
+
+
+          def diff(old, new):
+              added = [l for l in new if l not in old]
+              removed = [l for l in old if l not in new]
+              parts = []
+              if added:
+                  parts.append("EKLENEN:\n" +
+                               "\n".join("  + " + l for l in added[:25]))
+              if removed:
+                  parts.append("KALDIRILAN:\n" +
+                               "\n".join("  - " + l for l in removed[:25]))
+              return "\n\n".join(parts) or "Icerik yeniden duzenlenmis."
+
+
+          state = {}
+          if STATE.exists():
+              try:
+                  state = json.loads(STATE.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  state = {}
+
+          dirty = False
+          for url in URLS:
+              try:
+                  lines = fetch(url)
+              except Exception as exc:
+                  print("[HATA]", url, exc, file=sys.stderr)
+                  continue
+
+              h = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+              prev = state.get(url)
+
+              if prev is None:
+                  print("[ILK CALISMA]", url, len(lines), "satir")
+                  tg("Izleme basladi\n%s\n\nSu an %d satir icerik var. "
+                     "Degisiklik olursa haber verecegim." % (url, len(lines)))
+              elif prev["hash"] == h:
+                  print("[DEGISIKLIK YOK]", url)
+                  continue
+              else:
+                  print("[DEGISTI]", url)
+                  tg("SAYFA DEGISTI!\n%s\n\n%s"
+                     % (url, diff(prev.get("lines", []), lines)))
+
+              state[url] = {"hash": h, "lines": lines}
+              dirty = True
+
+          if dirty:
+              STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+          PYEOF
+
+      - name: Dakikada bir kontrol et
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          DEADLINE=$(( $(date +%s) + 240 ))   # ~4 dakika calis, sonraki cron devrali
+          while : ; do
+            python3 check.py || echo "kontrol basarisiz, devam ediliyor"
+            NOW=$(date +%s)
+            [ "$NOW" -ge "$DEADLINE" ] && break
+            sleep 55
+          done
+
+      - name: Durumu kaydet
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "togg-watcher"
+            git config user.email "actions@github.com"
+            git add state.json
+            git commit -m "durum guncellendi"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
